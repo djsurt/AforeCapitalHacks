@@ -1,0 +1,38 @@
+# Virtual Environment
+myEnv/
+venv/
+virtualenv/
+
+# Environment variables with API keys
+.env
+.env.local
+
+# Generated/scraped data
+rtrvr_docs.txt
+rtrvr_docs.json
+
+# Generated podcast outputs
+output/
+
+# Audio files
+*.mp3
+*.wav
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
