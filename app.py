@@ -1,7 +1,7 @@
 """
 Podcast Generator — FastAPI Backend
 ====================================
-Orchestrates: rtrvr.ai (research) → MiniMax (script) → ElevenLabs (voice) → MiniMax (music) → pydub (stitch)
+Orchestrates: Wikipedia/scraper (research) → Claude (script) → ElevenLabs (voice) → pydub (stitch)
 """
 
 import os
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import anthropic
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,8 +27,8 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
-MINIMAX_GROUP_ID = os.getenv("MINIMAX_GROUP_ID", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ALEX = os.getenv("ELEVENLABS_VOICE_ALEX", "21m00Tcm4TlvDq8ikWAM")
 ELEVENLABS_VOICE_SAM = os.getenv("ELEVENLABS_VOICE_SAM", "AZnzlk1XvdvUeBnXmlld")
@@ -57,11 +58,11 @@ async def startup():
     global http_client
     http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
     logger.info("=== ENV CHECK ===")
-    logger.info(f"  MINIMAX_API_KEY:    {'SET (' + MINIMAX_API_KEY[:8] + '...)' if MINIMAX_API_KEY else 'NOT SET'}")
-    logger.info(f"  MINIMAX_GROUP_ID:   {MINIMAX_GROUP_ID or 'NOT SET'}")
+    logger.info(f"  ANTHROPIC_API_KEY:  {'SET (' + ANTHROPIC_API_KEY[:8] + '...)' if ANTHROPIC_API_KEY else 'NOT SET'}")
     logger.info(f"  ELEVENLABS_API_KEY: {'SET (' + ELEVENLABS_API_KEY[:8] + '...)' if ELEVENLABS_API_KEY else 'NOT SET'}")
     logger.info(f"  VOICE_ALEX:         {ELEVENLABS_VOICE_ALEX}")
     logger.info(f"  VOICE_SAM:          {ELEVENLABS_VOICE_SAM}")
+    logger.info(f"  ANTHROPIC_MODEL:    {ANTHROPIC_MODEL}")
     logger.info("=================")
 
 
@@ -75,9 +76,9 @@ async def shutdown():
 # PHASE 2 — Research via Wikipedia + simple scraper
 # ===================================================================
 
-async def research_topic(topic: str) -> str:
+async def research_topic(topic: str) -> tuple[str, str | None]:
     """
-    Search Wikipedia for the topic and return a research brief.
+    Search Wikipedia for the topic and return (research_brief, wikipedia_url).
     Uses Wikipedia's free OpenSearch + REST summary APIs — no key needed.
     """
     try:
@@ -100,10 +101,13 @@ async def research_topic(topic: str) -> str:
 
         if not titles:
             logger.warning(f"[wikipedia] No results for: {topic}")
-            return f"Topic: {topic}. (No Wikipedia article found — generate from general knowledge.)"
+            return f"Topic: {topic}. (No Wikipedia article found — generate from general knowledge.)", None
 
         article_title = titles[0]
-        logger.info(f"[wikipedia] Found article: {article_title}")
+        # Extract URL from OpenSearch results (index 3 contains URLs)
+        urls = search_data[3] if len(search_data) > 3 else []
+        wikipedia_url = urls[0] if urls else None
+        logger.info(f"[wikipedia] Found article: {article_title} — {wikipedia_url}")
 
         # Step 2: Fetch full extract via the extracts API
         extract_resp = await http_client.get(
@@ -129,17 +133,19 @@ async def research_topic(topic: str) -> str:
 
         if extract:
             brief = f"Wikipedia — {article_title}\n\n{extract}"
+            if wikipedia_url:
+                brief += f"\n\nSource: {wikipedia_url}"
             logger.info(f"[wikipedia] Got extract ({len(brief)} chars)")
-            return brief
+            return brief, wikipedia_url
         else:
-            return f"Topic: {topic}. (Wikipedia extract was empty — generate from general knowledge.)"
+            return f"Topic: {topic}. (Wikipedia extract was empty — generate from general knowledge.)", wikipedia_url
 
     except Exception as e:
         logger.error(f"[wikipedia] Error: {e}")
-        return f"Topic: {topic}. (Wikipedia lookup failed — generate from general knowledge.)"
+        return f"Topic: {topic}. (Wikipedia lookup failed — generate from general knowledge.)", None
 
 
-async def research_url(url: str) -> str:
+async def research_url(url: str) -> tuple[str, str | None]:
     """
     Scrape a URL with httpx + BeautifulSoup and extract readable text.
     """
@@ -170,20 +176,20 @@ async def research_url(url: str) -> str:
 
         if excerpt:
             logger.info(f"[scraper] Extracted {len(excerpt)} chars from {url}")
-            return f"Source: {url}\n\n{excerpt}"
+            return f"Source: {url}\n\n{excerpt}", url
         else:
-            return f"Article URL: {url}. (Page content was empty — generate from general knowledge.)"
+            return f"Article URL: {url}. (Page content was empty — generate from general knowledge.)", url
 
     except Exception as e:
         logger.error(f"[scraper] Error fetching {url}: {e}")
-        return f"Article URL: {url}. (Scraping failed — generate from general knowledge.)"
+        return f"Article URL: {url}. (Scraping failed — generate from general knowledge.)", url
 
 
 # ===================================================================
-# PHASE 3 — Script generation via MiniMax LLM
+# PHASE 3 — Script generation via Claude
 # ===================================================================
 
-SCRIPT_SYSTEM_PROMPT = """You are a podcast script writer. Write a 3-5 minute conversational
+SCRIPT_SYSTEM_PROMPT = """You are a podcast script writer. Write a 2-minute conversational
 podcast between two hosts:
 - Alex: curious, asks good questions, uses analogies
 - Sam: the expert, explains things clearly, occasionally funny
@@ -191,7 +197,8 @@ podcast between two hosts:
 Rules:
 - Make it feel natural, not like a lecture
 - Include a short intro and sign-off
-- Keep it to 8-12 exchanges total
+- Write 16-22 exchanges total — each exchange should have substantive content (not one-liners)
+- At ~6-8 seconds per spoken line, 20 exchanges yields roughly 2 minutes of audio
 - Format output as a JSON array:
   [{"speaker": "Alex", "text": "..."}, {"speaker": "Sam", "text": "..."}, ...]
 - Return ONLY the JSON array, no other text."""
@@ -199,11 +206,11 @@ Rules:
 
 async def generate_script(topic: str, research_brief: str, tone: str = "casual") -> list[dict]:
     """
-    Call MiniMax LLM to generate podcast script.
+    Call Claude to generate podcast script.
     Returns list of {"speaker": "Alex"|"Sam", "text": "..."} dicts.
     """
-    if not MINIMAX_API_KEY:
-        logger.warning("MINIMAX_API_KEY not set — returning placeholder script")
+    if not ANTHROPIC_API_KEY:
+        logger.warning("ANTHROPIC_API_KEY not set — returning placeholder script")
         return _placeholder_script(topic)
 
     user_prompt = f"""Topic: {topic}
@@ -213,37 +220,36 @@ Research Brief:
 
 Generate the podcast script now as a JSON array."""
 
-    # MiniMax chat completions API
-    payload = {
-        "model": "MiniMax-Text-01",
-        "messages": [
-            {"role": "system", "content": SCRIPT_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.85,
-        "max_tokens": 4096,
-    }
-
     try:
-        logger.info("[minimax] Generating script...")
-        resp = await http_client.post(
-            "https://api.minimaxi.chat/v1/text/chatcompletion_v2",
-            headers={
-                "Authorization": f"Bearer {MINIMAX_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
+        logger.info("[claude] Generating script...")
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        message = await client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=8192,
+            system=SCRIPT_SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.85,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
-        content = data["choices"][0]["message"]["content"]
+        content = message.content[0].text
         script = _parse_script_json(content)
-        logger.info(f"[minimax] Generated {len(script)} dialogue lines")
+        logger.info(f"[claude] Generated {len(script)} dialogue lines")
         return script
 
+    except anthropic.APIStatusError as e:
+        if "credit balance" in str(e).lower() or e.status_code == 402:
+            logger.error(f"[claude] Billing error: {e}")
+            raise HTTPException(
+                status_code=402,
+                detail=f"Anthropic API billing error: {e.message}. "
+                       f"Check your balance or switch to a cheaper model via ANTHROPIC_MODEL env var (current: {ANTHROPIC_MODEL}).",
+            )
+        logger.error(f"[claude] API error: {e}")
+        return _placeholder_script(topic)
     except Exception as e:
-        logger.error(f"[minimax] Script generation failed: {e}")
+        logger.error(f"[claude] Script generation failed: {e}")
         return _placeholder_script(topic)
 
 
@@ -273,7 +279,7 @@ def _parse_script_json(text: str) -> list[dict]:
 
 
 def _placeholder_script(topic: str) -> list[dict]:
-    """Fallback script for when MiniMax is not available."""
+    """Fallback script for when Claude API is not available."""
     return [
         {"speaker": "Alex", "text": f"Hey Sam, today we're diving into {topic}. I've been really curious about this!"},
         {"speaker": "Sam", "text": f"Yeah, {topic} is fascinating. Let me break it down for you."},
@@ -343,88 +349,8 @@ async def generate_voice_clips(script: list[dict], job_id: str) -> list[Path]:
 
 
 # ===================================================================
-# PHASE 5 — Music + stitching via pydub
+# PHASE 5 — Stitching via pydub
 # ===================================================================
-
-async def generate_jingle(topic: str, job_id: str) -> Optional[Path]:
-    """
-    Call MiniMax Music API to generate a short jingle.
-    Returns path to jingle audio file, or None.
-    """
-    if not MINIMAX_API_KEY or not MINIMAX_GROUP_ID:
-        logger.warning("MINIMAX_API_KEY or GROUP_ID not set — skipping jingle generation")
-        return None
-
-    try:
-        # Submit music generation request
-        prompt = f"Upbeat 15-second podcast intro jingle, light acoustic guitar, soft percussion, professional friendly tone"
-        
-        logger.info(f"[minimax-music] Generating jingle: {prompt[:60]}...")
-        
-        # Simplified payload for music-01 model
-        submit_payload = {
-            "model": "music-01",
-            "prompt": prompt
-        }
-        
-        submit_resp = await http_client.post(
-            f"https://api.minimaxi.chat/v1/music_generation?GroupId={MINIMAX_GROUP_ID}",
-            headers={
-                "Authorization": f"Bearer {MINIMAX_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=submit_payload,
-        )
-        submit_resp.raise_for_status()
-        task_data = submit_resp.json()
-        
-        if "task_id" not in task_data:
-            logger.error(f"[minimax-music] No task_id in response: {task_data}")
-            return None
-            
-        task_id = task_data["task_id"]
-        logger.info(f"[minimax-music] Task submitted: {task_id}")
-        
-        # Poll for completion (max 60 seconds)
-        for attempt in range(30):
-            await asyncio.sleep(2)
-            
-            query_resp = await http_client.get(
-                f"https://api.minimaxi.chat/v1/query/music_generation?task_id={task_id}&GroupId={MINIMAX_GROUP_ID}",
-                headers={"Authorization": f"Bearer {MINIMAX_API_KEY}"},
-            )
-            query_resp.raise_for_status()
-            status_data = query_resp.json()
-            
-            status = status_data.get("status")
-            logger.info(f"[minimax-music] Status: {status} (attempt {attempt+1}/30)")
-            
-            if status == "Success":
-                audio_url = status_data.get("file", {}).get("download_url")
-                if not audio_url:
-                    logger.error("[minimax-music] No audio URL in response")
-                    return None
-                    
-                # Download the generated jingle
-                audio_resp = await http_client.get(audio_url)
-                audio_resp.raise_for_status()
-                
-                jingle_path = OUTPUT_DIR / job_id / "jingle.mp3"
-                jingle_path.write_bytes(audio_resp.content)
-                logger.info(f"[minimax-music] Jingle saved: {jingle_path}")
-                return jingle_path
-                
-            elif status == "Failed":
-                logger.error(f"[minimax-music] Generation failed: {status_data}")
-                return None
-        
-        logger.warning("[minimax-music] Timeout waiting for jingle generation")
-        return None
-        
-    except Exception as e:
-        logger.error(f"[minimax-music] Jingle generation failed: {e}")
-        return None
-
 
 def stitch_podcast(clip_paths: list[Path], jingle_path: Optional[Path], job_id: str) -> Path:
     """
@@ -538,11 +464,11 @@ async def generate_podcast(request: Request):
 
     # --- Phase 2: Research ---
     if url:
-        research_brief = await research_url(url)
+        research_brief, wikipedia_url = await research_url(url)
         if not topic:
             topic = f"Article from {url}"
     else:
-        research_brief = await research_topic(topic)
+        research_brief, wikipedia_url = await research_topic(topic)
 
     # --- Phase 3: Script ---
     script = await generate_script(topic, research_brief, tone)
@@ -550,9 +476,8 @@ async def generate_podcast(request: Request):
     # --- Phase 4: Voice ---
     clip_paths = await generate_voice_clips(script, job_id)
 
-    # --- Phase 5: Music + Stitch ---
-    jingle_path = await generate_jingle(topic, job_id)
-    final_path = stitch_podcast(clip_paths, jingle_path, job_id)
+    # --- Phase 5: Stitch ---
+    final_path = stitch_podcast(clip_paths, None, job_id)
 
     # Build response
     audio_url = f"/output/{job_id}/podcast.mp3" if final_path.exists() else None
@@ -563,6 +488,7 @@ async def generate_podcast(request: Request):
         "tone": tone,
         "script": script,
         "research_brief": research_brief[:500] + "..." if len(research_brief) > 500 else research_brief,
+        "wikipedia_url": wikipedia_url,
         "audio_url": audio_url,
         "has_audio": bool(clip_paths),
         "clip_count": len(clip_paths),
@@ -575,9 +501,10 @@ async def health():
     return {
         "status": "ok",
         "keys_configured": {
-            "minimax": bool(MINIMAX_API_KEY),
+            "anthropic": bool(ANTHROPIC_API_KEY),
             "elevenlabs": bool(ELEVENLABS_API_KEY),
         },
+        "anthropic_model": ANTHROPIC_MODEL,
     }
 
 
